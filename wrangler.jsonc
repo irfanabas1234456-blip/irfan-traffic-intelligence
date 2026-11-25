@@ -1,0 +1,20 @@
+
+{
+  "name": "traffici-ntelligence",
+  "main": "worker.js",
+  "compatibility_date": "2026-11-24",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "DOMAIN_LOCKS",
+        "class_name": "DomainLock"
+      }
+    ]
+  },
+  "exports": {
+    "DomainLock": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}
