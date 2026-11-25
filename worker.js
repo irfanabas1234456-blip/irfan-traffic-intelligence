@@ -7,6 +7,11 @@ const CACHE_TTL = 30 * 24 * 60 * 60;
 const STALE_TTL = 365 * 24 * 60 * 60;
 const HISTORY_TTL = 31536000;
 
+// DAILY API BUDGET
+const DAILY_BUDGET_CENTS = 50;
+const ANALYSIS_RESERVE_CENTS = 16;
+const DAILY_ANALYSIS_LIMIT = 3;
+
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -176,6 +181,63 @@ async function getSavedReport(env, domain, stale = false) {
   return saved;
 }
 
+// ======================================================
+// GLOBAL DAILY BUDGET PROTECTION
+// Uses D1 database binding: DB
+// ======================================================
+
+async function reserveDailyBudget(env) {
+  if (!env.DB) {
+    return {
+      ok: false,
+      reason: "Daily budget protection is unavailable because the D1 DB binding is missing."
+    };
+  }
+
+  const day = new Date().toISOString().slice(0, 10);
+  const now = new Date().toISOString();
+
+  try {
+    const row = await env.DB.prepare(`
+      INSERT INTO api_daily_budget
+        (day, reserved_cents, analyses, updated_at)
+      VALUES (?, ?, 1, ?)
+      ON CONFLICT(day) DO UPDATE SET
+        reserved_cents = reserved_cents + excluded.reserved_cents,
+        analyses = analyses + 1,
+        updated_at = excluded.updated_at
+      WHERE api_daily_budget.reserved_cents + excluded.reserved_cents <= ?
+        AND api_daily_budget.analyses < ?
+      RETURNING reserved_cents, analyses
+    `).bind(
+      day,
+      ANALYSIS_RESERVE_CENTS,
+      now,
+      DAILY_BUDGET_CENTS,
+      DAILY_ANALYSIS_LIMIT
+    ).first();
+
+    if (!row) {
+      return {
+        ok: false,
+        reason: "Daily public analysis limit reached. Please try again tomorrow."
+      };
+    }
+
+    return {
+      ok: true,
+      reservedCents: row.reserved_cents,
+      analyses: row.analyses
+    };
+
+  } catch (error) {
+    return {
+      ok: false,
+      reason: "Daily budget database error. New analysis is paused to protect API credits."
+    };
+  }
+}
+
 async function analyzeDomain(request, env) {
   const url = new URL(request.url);
   let domain;
@@ -204,6 +266,20 @@ async function analyzeDomain(request, env) {
       domain,
       error: "This domain has no saved report yet. Live analysis is temporarily unavailable because the YepAPI key is not configured."
     }, 503);
+  }
+
+  // Reserve budget only after checking saved reports.
+  // Cached reports do not consume the daily analysis allowance.
+  const budget = await reserveDailyBudget(env);
+
+  if (!budget.ok) {
+    if (staleReport) return json(staleReport);
+
+    return json({
+      ok: false,
+      domain,
+      error: budget.reason
+    }, 429);
   }
 
   try {
@@ -505,7 +581,7 @@ async function healthCheck(env) {
   return json({
     ok: true,
     worker: "IRFAN Traffic Intelligence",
-    version: "9.0-domain-durable-lock-30-day",
+    version: "10.0-global-daily-budget",
 
     publicDashboard: true,
     publicAnalyzer: true,
@@ -517,6 +593,11 @@ async function healthCheck(env) {
     yepapiConfigured: Boolean(env.YEPAPI_API_KEY),
     kvConfigured: Boolean(env.TRAFFIC_HISTORY),
     durableObjectConfigured: Boolean(env.DOMAIN_LOCKS),
+    d1Configured: Boolean(env.DB),
+
+    dailyBudgetLimitUSD: DAILY_BUDGET_CENTS / 100,
+    perAnalysisReserveUSD: ANALYSIS_RESERVE_CENTS / 100,
+    dailyAnalysisLimit: DAILY_ANALYSIS_LIMIT,
 
     cacheDurationDays: 30,
     backupDurationDays: 365,
@@ -525,7 +606,7 @@ async function healthCheck(env) {
       "YepAPI Domain Metrics (whole-domain traffic) + Domain Keywords (US rankings) + Domain Pages (US page estimates)",
 
     trafficPolicy:
-      "Per-domain Durable Object serialization and persistent 30-day report cache. Successful reports are reused by all visitors. Whole-domain traffic is a third-party estimate. Country traffic distribution is not fabricated. Genuine zero values are preserved."
+      "Global D1 daily budget reservation, per-domain Durable Object serialization and persistent 30-day report cache. Successful reports are reused by all visitors. Whole-domain traffic is a third-party estimate. Country traffic distribution is not fabricated. Genuine zero values are preserved."
   });
 }
 
@@ -1314,10 +1395,16 @@ async function checkApi() {
         "YepAPI is configured, but the DOMAIN_LOCKS Durable Object binding is missing.",
         true
       );
+    } else if (!data.d1Configured) {
+      $("systemStatus").textContent = "● BUDGET DB NOT CONFIGURED";
+      publicMessage(
+        "The D1 DB binding is missing. New analysis is paused to protect API credits.",
+        true
+      );
     } else {
       $("systemStatus").textContent = "● WORKER ONLINE";
       publicMessage(
-        "Worker, YepAPI and Durable Object are configured. This check confirms configuration, not remaining API credits."
+        "Worker, YepAPI, Durable Object and daily budget database are configured. Daily protection: maximum 3 new analyses with a $0.50 reservation limit. This check does not show remaining YepAPI account credits."
       );
     }
   } catch (e) {
@@ -1361,4 +1448,3 @@ $("healthCheck").addEventListener("click", checkApi);
 </script>
 </body>
 </html>`;
-// Trigger Cloudflare Git deployment
