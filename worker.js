@@ -1,4 +1,3 @@
-
 const CACHE_PREFIX = "iti:public:domain:v7:";
 const STALE_PREFIX = "iti:public:stale:v7:";
 const HISTORY_PREFIX = "iti:public:history:v7:";
@@ -124,6 +123,120 @@ async function yepPost(env, path, body) {
   return data;
 }
 
+// ======================================================
+// VANEFORM COUNTRY TRAFFIC
+// Uses Cloudflare secret: VANEFORM_API_KEY
+// ======================================================
+
+async function vaneformGet(env, domain) {
+  if (!env.VANEFORM_API_KEY) {
+    throw new Error("VANEFORM_API_KEY secret is missing.");
+  }
+
+  const response = await fetch(
+    "https://vaneform.com/api/v1/domains/" +
+      encodeURIComponent(domain) +
+      "?include=scale",
+    {
+      method: "GET",
+      headers: {
+        "Authorization": "Bearer " + env.VANEFORM_API_KEY,
+        "Accept": "application/json"
+      }
+    }
+  );
+
+  const raw = await response.text();
+  let data;
+
+  try {
+    data = JSON.parse(raw);
+  } catch (_) {
+    throw new Error(
+      "Vaneform returned an invalid response (HTTP " +
+      response.status +
+      ")."
+    );
+  }
+
+  if (!response.ok || data?.error) {
+    const message =
+      data?.error?.message ||
+      data?.message ||
+      "Vaneform request failed (HTTP " + response.status + ").";
+
+    throw new Error(String(message).slice(0, 300));
+  }
+
+  const scale = data?.scale || {};
+  const totalVisits = safeNumber(scale.visits);
+
+  const allowedStatus = ["ready", "partial"];
+
+  if (
+    !allowedStatus.includes(String(data?.status || "").toLowerCase()) ||
+    !allowedStatus.includes(String(scale?.status || "").toLowerCase()) ||
+    totalVisits === null
+  ) {
+    return {
+      available: false,
+      countries: [],
+      totalVisits: null,
+      estimate: scale.estimate || null,
+      confidence: scale.confidence || null,
+      asOf: scale.as_of || null,
+      month: scale.month || null,
+      reportUrl: data?.report_url || null,
+      notice:
+        "Vaneform has not supplied usable monthly visit and country distribution data for this domain."
+    };
+  }
+
+  const regions = Array.isArray(scale.top_regions)
+    ? scale.top_regions
+    : [];
+
+  const countries = regions
+    .map(region => {
+      const country = String(region?.country || "").trim();
+      const share = safeNumber(region?.share);
+
+      if (
+        !country ||
+        share === null ||
+        share > 1
+      ) {
+        return null;
+      }
+
+      return {
+        country: country.slice(0, 100),
+        share,
+        sharePercent: Math.round(share * 10000) / 100,
+        estimatedVisits: Math.round(totalVisits * share),
+        dataScope: "Vaneform estimated monthly visits"
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.estimatedVisits - a.estimatedVisits)
+    .slice(0, 5);
+
+  return {
+    available: countries.length > 0,
+    countries,
+    totalVisits,
+    estimate: scale.estimate || null,
+    confidence: scale.confidence || null,
+    asOf: scale.as_of || null,
+    month: scale.month || null,
+    reportUrl: data?.report_url || null,
+
+    notice: countries.length
+      ? "Country figures are Vaneform estimates. Estimated country visits are calculated by multiplying Vaneform's monthly visits by each reported country share. These are not verified Google Analytics or Google Search Console visits."
+      : "Vaneform returned monthly visit data but did not supply usable country distribution."
+  };
+}
+
 async function kvGet(env, key) {
   if (!env.TRAFFIC_HISTORY) return null;
 
@@ -175,7 +288,7 @@ async function getSavedReport(env, domain, stale = false) {
   if (stale) {
     saved.stale = true;
     saved.staleNotice =
-      "Live data could not be refreshed. Showing the last successfully saved YepAPI report. The figures may be older than 30 days.";
+      "Live data could not be refreshed. Showing the last successfully saved report. The figures may be older than 30 days.";
   }
 
   return saved;
@@ -301,7 +414,13 @@ async function analyzeDomain(request, env) {
     }
 
     // Optional report sections.
-    const [keywordsRaw, pagesRaw, rankRaw] = await Promise.all([
+    // Vaneform failure does not stop the YepAPI report.
+    const [
+      keywordsRaw,
+      pagesRaw,
+      rankRaw,
+      vaneformRaw
+    ] = await Promise.all([
       yepPost(
         env,
         "/v1/seo/domain/keywords",
@@ -334,7 +453,21 @@ async function analyzeDomain(request, env) {
           location: "us",
           language: "en"
         }
-      ).catch(e => ({ _optionalError: e.message }))
+      ).catch(e => ({ _optionalError: e.message })),
+
+      vaneformGet(env, domain).catch(e => ({
+        available: false,
+        countries: [],
+        totalVisits: null,
+        estimate: null,
+        confidence: null,
+        asOf: null,
+        month: null,
+        reportUrl: null,
+        _optionalError: e.message,
+        notice:
+          "Vaneform country traffic data is temporarily unavailable. No country figures have been invented."
+      }))
     ]);
 
     const traffic = safeNumber(domainMetrics.traffic);
@@ -432,27 +565,42 @@ async function analyzeDomain(request, env) {
       keywords,
       pages,
 
-      // These selected YepAPI endpoints do not provide
-      // country-level traffic distribution.
-      countries: [],
+      // Vaneform country-level estimated visits.
+      // These are separate from YepAPI organic traffic.
+      countries: vaneformRaw.countries || [],
 
       countryNotice:
-        "Country-level traffic distribution is not supplied by the selected YepAPI endpoints. United States is only the selected keyword and page ranking-data location, not a verified traffic country.",
+        vaneformRaw.notice ||
+        "Country traffic distribution is not available.",
+
+      countrySource: "Vaneform",
+
+      countryTraffic: {
+        available: Boolean(vaneformRaw.available),
+        totalVisits: vaneformRaw.totalVisits ?? null,
+        estimate: vaneformRaw.estimate ?? null,
+        confidence: vaneformRaw.confidence ?? null,
+        asOf: vaneformRaw.asOf ?? null,
+        month: vaneformRaw.month ?? null,
+        reportUrl: vaneformRaw.reportUrl ?? null
+      },
 
       keywordLocation: "United States",
       pageLocation: "United States",
 
       history,
 
-      source: "YepAPI Domain Metrics + Domain Keywords + Domain Pages",
+      source:
+        "YepAPI Domain Metrics + Domain Keywords + Domain Pages + Vaneform Country Distribution",
 
       estimateNotice:
-        "Domain organic traffic is the provider's whole-domain monthly estimate from Domain Metrics. Keyword positions, keyword traffic and top-page traffic are US-location estimates. The United States label identifies the ranking-data location only; it does not represent the domain's main traffic country. These are third-party SEO database estimates, not verified Google Analytics visits or private Google Search Console measurements. Search volume is separate from estimated organic traffic. Missing provider values are shown as No Data. Genuine zero values remain 0.",
+        "Domain organic traffic is the provider's whole-domain monthly estimate from YepAPI Domain Metrics. Keyword positions, keyword search volumes and top-page traffic are US-location estimates from YepAPI. Country distribution and estimated monthly country visits are supplied separately by Vaneform. Country visit figures are calculated from Vaneform's monthly visits multiplied by its reported country shares. Vaneform's estimate scope may be site or search, as identified in its source data. These are third-party estimates, not verified Google Analytics visits or private Google Search Console measurements. Vaneform country visits must not be added to or confused with YepAPI organic traffic. Search volume is separate from estimated organic traffic. Missing provider values are shown as No Data. Genuine zero values remain 0.",
 
       optionalWarnings: [
         keywordsRaw._optionalError,
         pagesRaw._optionalError,
-        rankRaw._optionalError
+        rankRaw._optionalError,
+        vaneformRaw._optionalError
       ].filter(Boolean),
 
       cached: false,
@@ -499,8 +647,6 @@ export class DomainLock {
   }
 
   fetch(request) {
-    // Every request for this domain waits for the previous
-    // request to finish before it can start an API analysis.
     const task = this.queue.then(
       () => this.handle(request),
       () => this.handle(request)
@@ -526,9 +672,6 @@ export class DomainLock {
       return json({ ok: false, error: e.message }, 400);
     }
 
-    // Durable Object storage is strongly consistent.
-    // It prevents KV propagation delays from causing
-    // a second provider charge for the same domain.
     const saved = await this.state.storage.get("freshReport");
 
     if (
@@ -547,19 +690,13 @@ export class DomainLock {
       return json(report);
     }
 
-    // Expired saved report can no longer be served as fresh.
     if (saved) {
       await this.state.storage.delete("freshReport");
     }
 
-    // Only this serialized Durable Object request can now
-    // reach YepAPI for this domain.
     const response = await analyzeDomain(request, this.env);
     const result = await response.clone().json().catch(() => null);
 
-    // Persist only successful, fresh reports.
-    // Failed requests and stale backups do not reset the
-    // 30-day fresh-cache period.
     if (
       response.ok &&
       result?.ok === true &&
@@ -581,7 +718,7 @@ async function healthCheck(env) {
   return json({
     ok: true,
     worker: "IRFAN Traffic Intelligence",
-    version: "10.0-global-daily-budget",
+    version: "11.0-vaneform-country-traffic",
 
     publicDashboard: true,
     publicAnalyzer: true,
@@ -591,6 +728,8 @@ async function healthCheck(env) {
     trackeeConfigured: false,
 
     yepapiConfigured: Boolean(env.YEPAPI_API_KEY),
+    vaneformConfigured: Boolean(env.VANEFORM_API_KEY),
+
     kvConfigured: Boolean(env.TRAFFIC_HISTORY),
     durableObjectConfigured: Boolean(env.DOMAIN_LOCKS),
     d1Configured: Boolean(env.DB),
@@ -603,10 +742,10 @@ async function healthCheck(env) {
     backupDurationDays: 365,
 
     dataSource:
-      "YepAPI Domain Metrics (whole-domain traffic) + Domain Keywords (US rankings) + Domain Pages (US page estimates)",
+      "YepAPI Domain Metrics (whole-domain organic traffic) + Domain Keywords (US rankings) + Domain Pages (US page estimates) + Vaneform (estimated monthly visits and country distribution)",
 
     trafficPolicy:
-      "Global D1 daily budget reservation, per-domain Durable Object serialization and persistent 30-day report cache. Successful reports are reused by all visitors. Whole-domain traffic is a third-party estimate. Country traffic distribution is not fabricated. Genuine zero values are preserved."
+      "Global D1 daily budget reservation, per-domain Durable Object serialization and persistent 30-day report cache. Successful reports are reused by all visitors. YepAPI organic traffic and Vaneform country visit estimates are kept separate. Country estimates are never presented as verified Google Analytics or Google Search Console traffic. Genuine zero values are preserved."
   });
 }
 
@@ -616,7 +755,7 @@ function htmlResponse(html) {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-cache",
       "content-security-policy":
-        "default-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; connect-src 'self' https://api.yepapi.com; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com"
+        "default-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; connect-src 'self' https://api.yepapi.com https://vaneform.com; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com"
     }
   });
 }
@@ -661,7 +800,6 @@ export default {
         return json({ ok: false, error: e.message }, 400);
       }
 
-      // A stable Durable Object ID is created for each normalized domain.
       const id = env.DOMAIN_LOCKS.idFromName(domain);
       const stub = env.DOMAIN_LOCKS.get(id);
 
@@ -819,7 +957,7 @@ td a:hover{text-decoration:underline}
 <header class="header">
   <div>
     <h1>IRFAN Traffic Intelligence</h1>
-    <div class="sub">PROFESSIONAL SEO ANALYTICS · YEPAPI SEO DATABASE</div>
+    <div class="sub">PROFESSIONAL SEO ANALYTICS · YEPAPI + VANEFORM DATA</div>
   </div>
   <div style="display:flex;align-items:center;gap:10px">
     <span class="status" id="systemStatus">● PUBLIC ANALYZER</span>
@@ -833,7 +971,7 @@ td a:hover{text-decoration:underline}
       <h2>Domain Analyzer</h2>
       <div class="small">Analyze any public website · No Google login required</div>
     </div>
-    <span class="status">● YEPAPI DOMAIN DATA</span>
+    <span class="status">● YEPAPI + VANEFORM DATA</span>
   </div>
   <div class="sitebox">
     <input id="publicDomain" type="text" placeholder="Enter website domain, e.g. example.com" autocomplete="url" aria-label="Website domain">
@@ -889,12 +1027,13 @@ td a:hover{text-decoration:underline}
 
   <div class="report-lower">
    <section class="report-section">
-     <h3>Top countries <span title="Country distribution">ⓘ</span></h3>
-     <div class="country-scope"><span class="country-scope-dot"></span>Country traffic distribution</div>
+     <h3>Top countries <span title="Estimated country distribution">ⓘ</span></h3>
+     <div class="country-scope"><span class="country-scope-dot"></span>Vaneform estimated monthly visits</div>
      <table class="report-table">
-       <thead><tr><th>Country</th><th class="num">Data coverage</th></tr></thead>
-       <tbody id="pubCountryRows"><tr><td colspan="2" class="report-empty">No Data</td></tr></tbody>
+       <thead><tr><th>Country</th><th class="num">Estimated Visits</th><th class="num">Share</th></tr></thead>
+       <tbody id="pubCountryRows"><tr><td colspan="3" class="report-empty">No Data</td></tr></tbody>
      </table>
+     <div id="pubCountryNote" class="report-status">Country distribution is shown only when Vaneform supplies it.</div>
    </section>
 
    <section class="report-section">
@@ -915,7 +1054,7 @@ td a:hover{text-decoration:underline}
 
   <div class="report-note">
     <span class="info">i</span>
-    <span id="pubDisclaimer">Domain traffic is a whole-domain third-party estimate. Keyword and page estimates are US-location data. Country distribution is shown only when the provider supplies it.</span>
+    <span id="pubDisclaimer">Domain organic traffic is a YepAPI third-party estimate. Country distribution is a separate Vaneform estimate. Neither represents verified Google Analytics or private Google Search Console data.</span>
   </div>
   <div class="report-status" id="pubCheckedAt"></div>
  </section>
@@ -982,15 +1121,15 @@ td a:hover{text-decoration:underline}
     <section class="panel" id="dashboardCountries">
       <div class="section-title">
         <h2>Top Countries</h2>
-        <span class="small">Traffic distribution</span>
+        <span class="small">Vaneform estimated visits</span>
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Country</th><th>Data coverage</th></tr></thead>
-          <tbody id="dashboardCountryRows"><tr><td colspan="2" class="empty">Country data not supplied by provider.</td></tr></tbody>
+          <thead><tr><th>Country</th><th>Estimated Visits</th><th>Traffic Share</th></tr></thead>
+          <tbody id="dashboardCountryRows"><tr><td colspan="3" class="empty">No country data available.</td></tr></tbody>
         </table>
       </div>
-      <p class="small">The selected YepAPI endpoints do not provide country-level traffic distribution.</p>
+      <p class="small" id="dashboardCountryNote">Country distribution is supplied separately by Vaneform and is not verified Google traffic.</p>
     </section>
   </div>
 
@@ -1238,6 +1377,52 @@ function renderPages(pages) {
     : '<tr><td colspan="3" class="empty">No page traffic data supplied by provider.</td></tr>';
 }
 
+// ======================================================
+// COUNTRY RENDERING
+// ======================================================
+
+function renderCountries(countries, countryNotice) {
+  const rows = Array.isArray(countries) ? countries.slice(0, 5) : [];
+
+  if (!rows.length) {
+    const message = countryNotice || "Country traffic data is not available.";
+
+    $("pubCountryRows").innerHTML =
+      '<tr><td colspan="3" class="report-empty">' +
+      esc(message) +
+      "</td></tr>";
+
+    $("dashboardCountryRows").innerHTML =
+      '<tr><td colspan="3" class="empty">' +
+      esc(message) +
+      "</td></tr>";
+
+    $("pubCountryNote").textContent = message;
+    $("dashboardCountryNote").textContent = message;
+
+    return;
+  }
+
+  const html = rows.map(c =>
+    "<tr><td>" + esc(c.country || "—") +
+    '</td><td class="num">' + compactCount(c.estimatedVisits) +
+    '</td><td class="num">' +
+    (c.sharePercent === null || c.sharePercent === undefined
+      ? "No Data"
+      : esc(c.sharePercent) + "%") +
+    "</td></tr>"
+  ).join("");
+
+  $("pubCountryRows").innerHTML = html;
+  $("dashboardCountryRows").innerHTML = html;
+
+  const note = countryNotice ||
+    "Country visits are third-party estimates supplied by Vaneform.";
+
+  $("pubCountryNote").textContent = note;
+  $("dashboardCountryNote").textContent = note;
+}
+
 function renderPublicAnalysis(d) {
   const o = d.overview || {};
   const pos = o.positions || {};
@@ -1257,7 +1442,7 @@ function renderPublicAnalysis(d) {
   $("pubUR").textContent = o.urlRating === null || o.urlRating === undefined ? "No Data" : String(o.urlRating);
 
   $("dashboardDomain").textContent =
-    "Domain: " + d.domain + " · Whole-domain traffic estimate · Source: YepAPI";
+    "Domain: " + d.domain + " · Organic traffic: YepAPI · Country estimates: Vaneform";
 
   $("dashTraffic").textContent = compactCount(o.organicTraffic);
   $("dashKeywords").textContent = compactCount(o.organicKeywords);
@@ -1266,24 +1451,14 @@ function renderPublicAnalysis(d) {
 
   renderTrafficHistory(d.history, o.organicTraffic);
 
-  const countries = Array.isArray(d.countries) ? d.countries : [];
+  renderCountries(
+    d.countries || [],
+    d.countryNotice || "Country traffic data is not available."
+  );
 
-  const countryHtml = countries.length
-    ? countries.slice(0, 5).map(c =>
-        "<tr><td>" + esc(c.country || "—") +
-        '</td><td class="num">' + esc(c.dataScope || "No traffic-share data") + "</td></tr>"
-      ).join("")
-    : '<tr><td colspan="2" class="report-empty">' +
-      esc(d.countryNotice || "Country traffic data is not available from these endpoints.") +
-      "</td></tr>";
+  $("pubKeywordCountry").textContent =
+    d.keywordLocation ? "(" + d.keywordLocation + " rankings)" : "";
 
-  $("pubCountryRows").innerHTML = countryHtml;
-
-  $("dashboardCountryRows").innerHTML = countries.length
-    ? countryHtml
-    : '<tr><td colspan="2" class="empty">Country-level traffic is not supplied by the selected YepAPI endpoints.</td></tr>';
-
-  $("pubKeywordCountry").textContent = d.keywordLocation ? "(" + d.keywordLocation + " rankings)" : "";
   renderKeywords(d.keywords || []);
   renderPages(d.pages || []);
 
@@ -1291,11 +1466,23 @@ function renderPublicAnalysis(d) {
     d.staleNotice
       ? d.staleNotice + " " + (d.estimateNotice || "")
       : (d.estimateNotice ||
-        "Metrics are third-party SEO database estimates, not verified Google Analytics or private Google Search Console measurements.");
+        "Metrics are third-party estimates, not verified Google Analytics or private Google Search Console measurements.");
+
+  const countryMeta = d.countryTraffic || {};
+
+  const countryDetails = [
+    countryMeta.estimate ? "Vaneform scope: " + countryMeta.estimate : "",
+    countryMeta.confidence ? "Confidence: " + countryMeta.confidence : "",
+    countryMeta.asOf ? "Country data as of: " + countryMeta.asOf : "",
+    countryMeta.month ? "Month: " + countryMeta.month : ""
+  ].filter(Boolean).join(" · ");
 
   $("pubCheckedAt").textContent =
     "Domain: " + d.domain +
-    " · Source: YepAPI Domain Metrics · Checked: " +
+    " · Organic source: YepAPI" +
+    " · Country source: Vaneform" +
+    (countryDetails ? " · " + countryDetails : "") +
+    " · Checked: " +
     new Date(d.checkedAt || Date.now()).toLocaleString() +
     (d.stale ? " · SAVED BACKUP REPORT" : d.cached ? " · CACHED REPORT" : "");
 
@@ -1348,11 +1535,11 @@ async function runPublicAnalysis() {
       );
     } else if (data.cached) {
       publicMessage(
-        "Showing saved YepAPI data. No new API request was needed."
+        "Showing saved report data. No new provider request was needed."
       );
     } else {
       publicMessage(
-        "Analysis complete. Whole-domain traffic estimate loaded from YepAPI Domain Metrics."
+        "Analysis complete. Organic traffic loaded from YepAPI and country estimates loaded from Vaneform when available."
       );
     }
 
@@ -1401,10 +1588,16 @@ async function checkApi() {
         "The D1 DB binding is missing. New analysis is paused to protect API credits.",
         true
       );
+    } else if (!data.vaneformConfigured) {
+      $("systemStatus").textContent = "● VANEFORM NOT CONFIGURED";
+      publicMessage(
+        "YepAPI is configured, but the VANEFORM_API_KEY secret is missing. Country traffic data will not be available.",
+        true
+      );
     } else {
       $("systemStatus").textContent = "● WORKER ONLINE";
       publicMessage(
-        "Worker, YepAPI, Durable Object and daily budget database are configured. Daily protection: maximum 3 new analyses with a $0.50 reservation limit. This check does not show remaining YepAPI account credits."
+        "Worker, YepAPI, Vaneform, Durable Object and daily budget database are configured. Daily protection: maximum 3 new analyses with a $0.50 reservation limit. This check does not show remaining provider credits."
       );
     }
   } catch (e) {
