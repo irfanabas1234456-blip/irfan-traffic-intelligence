@@ -1,15 +1,10 @@
-const CACHE_PREFIX = "iti:public:domain:v7:";
-const STALE_PREFIX = "iti:public:stale:v7:";
-const HISTORY_PREFIX = "iti:public:history:v7:";
 
-const CACHE_TTL = 30 * 24 * 60 * 60;
-const STALE_TTL = 365 * 24 * 60 * 60;
-const HISTORY_TTL = 31536000;
-
-// DAILY API BUDGET
-const DAILY_BUDGET_CENTS = 50;
-const ANALYSIS_RESERVE_CENTS = 16;
-const DAILY_ANALYSIS_LIMIT = 3;
+const CACHE_PREFIX = "iti:free:domain:v1:";
+const CACHE_TTL = 24 * 60 * 60;
+const MAX_HTML_BYTES = 1024 * 1024;
+const MAX_XML_BYTES = 1024 * 1024;
+const MAX_PAGES = 5;
+const FETCH_TIMEOUT = 10000;
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -28,11 +23,6 @@ function safeNumber(value) {
   return Number.isFinite(n) && n >= 0 ? n : null;
 }
 
-// Preserve genuine zero values.
-function positiveEstimate(value) {
-  return safeNumber(value);
-}
-
 function normalizePublicDomain(value) {
   const input = String(value || "").trim();
 
@@ -43,9 +33,7 @@ function normalizePublicDomain(value) {
   let parsed;
 
   try {
-    parsed = new URL(
-      /^https?:\/\//i.test(input) ? input : "https://" + input
-    );
+    parsed = new URL(/^https?:\/\//i.test(input) ? input : "https://" + input);
   } catch (_) {
     throw new Error("Enter a valid website URL or domain.");
   }
@@ -53,7 +41,8 @@ function normalizePublicDomain(value) {
   if (
     !["http:", "https:"].includes(parsed.protocol) ||
     parsed.username ||
-    parsed.password
+    parsed.password ||
+    parsed.port
   ) {
     throw new Error("Enter a valid public HTTP or HTTPS website.");
   }
@@ -64,15 +53,13 @@ function normalizePublicDomain(value) {
     !domain.includes(".") ||
     domain.length > 253 ||
     !/^[a-z0-9.-]+$/.test(domain) ||
-    domain.includes("..")
-  ) {
-    throw new Error("Enter a valid public website domain.");
-  }
-
-  if (
+    domain.includes("..") ||
+    domain.startsWith(".") ||
+    domain.endsWith(".") ||
     domain === "localhost" ||
     domain.endsWith(".localhost") ||
     domain.endsWith(".local") ||
+    domain.endsWith(".internal") ||
     /^\d{1,3}(\.\d{1,3}){3}$/.test(domain)
   ) {
     throw new Error("Enter a public domain name, not a local or IP address.");
@@ -81,159 +68,398 @@ function normalizePublicDomain(value) {
   return domain;
 }
 
-function unwrap(data) {
-  if (!data || typeof data !== "object") return {};
-  return data.data && typeof data.data === "object" ? data.data : data;
-}
-
-async function yepPost(env, path, body) {
-  if (!env.YEPAPI_API_KEY) {
-    throw new Error("YEPAPI_API_KEY secret is missing in Cloudflare Worker settings.");
-  }
-
-  const response = await fetch("https://api.yepapi.com" + path, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": env.YEPAPI_API_KEY
-    },
-    body: JSON.stringify(body)
-  });
-
-  const raw = await response.text();
-  let data;
-
+function isSafePublicUrl(value) {
   try {
-    data = JSON.parse(raw);
-  } catch (_) {
-    throw new Error("YepAPI returned an invalid response (HTTP " + response.status + ").");
-  }
+    const u = new URL(value);
 
-  if (!response.ok || data?.ok === false || data?.error) {
-    const message =
-      data?.message ||
-      data?.error?.message ||
-      data?.error ||
-      data?.detail ||
-      ("YepAPI request failed (HTTP " + response.status + ")");
-
-    throw new Error(String(message).slice(0, 350));
-  }
-
-  return data;
-}
-
-// ======================================================
-// VANEFORM COUNTRY TRAFFIC
-// Uses Cloudflare secret: VANEFORM_API_KEY
-// ======================================================
-
-async function vaneformGet(env, domain) {
-  if (!env.VANEFORM_API_KEY) {
-    throw new Error("VANEFORM_API_KEY secret is missing.");
-  }
-
-  const response = await fetch(
-    "https://vaneform.com/api/v1/domains/" +
-      encodeURIComponent(domain) +
-      "?include=scale",
-    {
-      method: "GET",
-      headers: {
-        "Authorization": "Bearer " + env.VANEFORM_API_KEY,
-        "Accept": "application/json"
-      }
-    }
-  );
-
-  const raw = await response.text();
-  let data;
-
-  try {
-    data = JSON.parse(raw);
-  } catch (_) {
-    throw new Error(
-      "Vaneform returned an invalid response (HTTP " +
-      response.status +
-      ")."
+    return (
+      ["http:", "https:"].includes(u.protocol) &&
+      !u.username &&
+      !u.password &&
+      !u.port &&
+      !u.hostname.endsWith(".local") &&
+      !u.hostname.endsWith(".localhost") &&
+      !u.hostname.endsWith(".internal") &&
+      !/^\d{1,3}(\.\d{1,3}){3}$/.test(u.hostname)
     );
+  } catch (_) {
+    return false;
+  }
+}
+
+async function readLimited(response, limit) {
+  if (!response.body) return "";
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    total += value.byteLength;
+
+    if (total > limit) {
+      await reader.cancel();
+      throw new Error("Website response is too large for the free analysis limit.");
+    }
+
+    chunks.push(value);
   }
 
-  if (!response.ok || data?.error) {
-    const message =
-      data?.error?.message ||
-      data?.message ||
-      "Vaneform request failed (HTTP " + response.status + ").";
+  const merged = new Uint8Array(total);
+  let offset = 0;
 
-    throw new Error(String(message).slice(0, 300));
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
   }
 
-  const scale = data?.scale || {};
-  const totalVisits = safeNumber(scale.visits);
+  return new TextDecoder("utf-8").decode(merged);
+}
 
-  const allowedStatus = ["ready", "partial"];
+async function fetchPublicPage(input, limit = MAX_HTML_BYTES) {
+  let current = new URL(input);
 
-  if (
-    !allowedStatus.includes(String(data?.status || "").toLowerCase()) ||
-    !allowedStatus.includes(String(scale?.status || "").toLowerCase()) ||
-    totalVisits === null
-  ) {
+  for (let i = 0; i <= 3; i++) {
+    if (!isSafePublicUrl(current.href)) {
+      throw new Error("The website redirected to an unsupported address.");
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
+
+    let response;
+
+    try {
+      response = await fetch(current.href, {
+        method: "GET",
+        redirect: "manual",
+        signal: controller.signal,
+        headers: {
+          "User-Agent": "IRFAN-Traffic-Intelligence-Free-Audit/1.0",
+          "Accept": "text/html,application/xhtml+xml,application/xml,text/plain,*/*"
+        }
+      });
+    } catch (error) {
+      if (error.name === "AbortError") {
+        throw new Error("The website took too long to respond.");
+      }
+      throw new Error("Could not connect to the public website.");
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers.get("location");
+
+      if (!location || i === 3) {
+        throw new Error("The website has too many redirects.");
+      }
+
+      current = new URL(location, current);
+      continue;
+    }
+
+    const contentType = response.headers.get("content-type") || "";
+    const text = await readLimited(response, limit);
+
     return {
-      available: false,
-      countries: [],
-      totalVisits: null,
-      estimate: scale.estimate || null,
-      confidence: scale.confidence || null,
-      asOf: scale.as_of || null,
-      month: scale.month || null,
-      reportUrl: data?.report_url || null,
-      notice:
-        "Vaneform has not supplied usable monthly visit and country distribution data for this domain."
+      status: response.status,
+      url: current.href,
+      contentType,
+      text,
+      headers: {
+        contentType,
+        server: response.headers.get("server") || null,
+        lastModified: response.headers.get("last-modified") || null,
+        contentLength: safeNumber(response.headers.get("content-length"))
+      }
     };
   }
 
-  const regions = Array.isArray(scale.top_regions)
-    ? scale.top_regions
-    : [];
+  throw new Error("Could not load the public website.");
+}
 
-  const countries = regions
-    .map(region => {
-      const country = String(region?.country || "").trim();
-      const share = safeNumber(region?.share);
+function decodeXml(value) {
+  return String(value || "")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+}
 
-      if (
-        !country ||
-        share === null ||
-        share > 1
-      ) {
+function extractTag(html, tag) {
+  const match = html.match(
+    new RegExp("<" + tag + "\\b[^>]*>([\\s\\S]*?)<\\/" + tag + "\\s*>", "i")
+  );
+
+  return match ? decodeXml(match[1].replace(/<[^>]*>/g, "").trim()) : null;
+}
+
+function extractMeta(html, name) {
+  const tags = html.match(/<meta\b[^>]*>/gi) || [];
+
+  for (const tag of tags) {
+    const nameMatch = tag.match(/\b(?:name|property)\s*=\s*["']([^"']+)["']/i);
+    const contentMatch = tag.match(/\bcontent\s*=\s*["']([^"']*)["']/i);
+
+    if (
+      nameMatch &&
+      contentMatch &&
+      nameMatch[1].toLowerCase() === name.toLowerCase()
+    ) {
+      return decodeXml(contentMatch[1].trim());
+    }
+  }
+
+  return null;
+}
+
+function extractCanonical(html, baseUrl) {
+  const tags = html.match(/<link\b[^>]*>/gi) || [];
+
+  for (const tag of tags) {
+    if (!/\brel\s*=\s*["'][^"']*\bcanonical\b[^"']*["']/i.test(tag)) continue;
+
+    const match = tag.match(/\bhref\s*=\s*["']([^"']+)["']/i);
+
+    if (match) {
+      try {
+        return new URL(decodeXml(match[1]), baseUrl).href;
+      } catch (_) {
         return null;
       }
+    }
+  }
 
-      return {
-        country: country.slice(0, 100),
-        share,
-        sharePercent: Math.round(share * 10000) / 100,
-        estimatedVisits: Math.round(totalVisits * share),
-        dataScope: "Vaneform estimated monthly visits"
-      };
-    })
-    .filter(Boolean)
-    .sort((a, b) => b.estimatedVisits - a.estimatedVisits)
-    .slice(0, 5);
+  return null;
+}
+
+function analyzeHtml(html, pageUrl, status, headers) {
+  const title = extractTag(html, "title");
+  const description = extractMeta(html, "description");
+  const h1Matches = html.match(/<h1\b[^>]*>/gi) || [];
+  const images = html.match(/<img\b[^>]*>/gi) || [];
+  const links = html.match(/<a\b[^>]*>/gi) || [];
+  const canonical = extractCanonical(html, pageUrl);
+  const robots = extractMeta(html, "robots");
+  const viewport = extractMeta(html, "viewport");
+
+  const imagesWithAlt = images.filter(tag =>
+    /\balt\s*=\s*["'][^"']+["']/i.test(tag)
+  ).length;
+
+  const internalLinks = links.filter(tag => {
+    const match = tag.match(/\bhref\s*=\s*["']([^"']+)["']/i);
+    if (!match) return false;
+
+    try {
+      return new URL(match[1], pageUrl).hostname === new URL(pageUrl).hostname;
+    } catch (_) {
+      return false;
+    }
+  }).length;
+
+  const externalLinks = Math.max(0, links.length - internalLinks);
+
+  const noindex = /\bnoindex\b/i.test(robots || "");
 
   return {
-    available: countries.length > 0,
-    countries,
-    totalVisits,
-    estimate: scale.estimate || null,
-    confidence: scale.confidence || null,
-    asOf: scale.as_of || null,
-    month: scale.month || null,
-    reportUrl: data?.report_url || null,
+    url: pageUrl,
+    status,
+    title,
+    titleLength: title ? title.length : 0,
+    description,
+    descriptionLength: description ? description.length : 0,
+    h1Count: h1Matches.length,
+    canonical,
+    robots,
+    noindex,
+    viewport: Boolean(viewport),
+    imageCount: images.length,
+    imagesWithAlt,
+    imagesWithoutAlt: Math.max(0, images.length - imagesWithAlt),
+    internalLinks,
+    externalLinks,
+    server: headers.server,
+    lastModified: headers.lastModified
+  };
+}
 
-    notice: countries.length
-      ? "Country figures are Vaneform estimates. Estimated country visits are calculated by multiplying Vaneform's monthly visits by each reported country share. These are not verified Google Analytics or Google Search Console visits."
-      : "Vaneform returned monthly visit data but did not supply usable country distribution."
+async function getRobots(domain, origin) {
+  const url = origin + "/robots.txt";
+
+  try {
+    const result = await fetchPublicPage(url, 150000);
+
+    if (result.status >= 400) {
+      return {
+        available: false,
+        status: result.status,
+        sitemaps: [],
+        rules: [],
+        notice: "robots.txt was not available."
+      };
+    }
+
+    const lines = result.text.split(/\r?\n/);
+    const sitemaps = [];
+    const rules = [];
+
+    for (const line of lines) {
+      const clean = line.trim();
+
+      if (/^sitemap\s*:/i.test(clean)) {
+        const sitemap = clean.replace(/^sitemap\s*:/i, "").trim();
+        if (isSafePublicUrl(sitemap)) sitemaps.push(sitemap);
+      }
+
+      if (/^(user-agent|allow|disallow)\s*:/i.test(clean)) {
+        rules.push(clean.slice(0, 300));
+      }
+    }
+
+    return {
+      available: true,
+      status: result.status,
+      sitemaps: [...new Set(sitemaps)].slice(0, 5),
+      rules: rules.slice(0, 30),
+      notice: "Public robots.txt file retrieved."
+    };
+  } catch (error) {
+    return {
+      available: false,
+      status: null,
+      sitemaps: [],
+      rules: [],
+      notice: error.message
+    };
+  }
+}
+
+async function getSitemap(origin, robotsSitemaps) {
+  const candidates = [
+    ...robotsSitemaps,
+    origin + "/sitemap.xml"
+  ];
+
+  const seen = new Set();
+  let urls = [];
+  let sitemapAvailable = false;
+
+  for (const candidate of candidates) {
+    if (seen.has(candidate) || !isSafePublicUrl(candidate)) continue;
+    seen.add(candidate);
+
+    try {
+      const result = await fetchPublicPage(candidate, MAX_XML_BYTES);
+
+      if (result.status >= 400) continue;
+
+      sitemapAvailable = true;
+
+      const locations = [...result.text.matchAll(/<loc\b[^>]*>([\s\S]*?)<\/loc>/gi)]
+        .map(match => decodeXml(match[1].trim()))
+        .filter(value => isSafePublicUrl(value));
+
+      const sitemapIndex = /<sitemapindex\b/i.test(result.text);
+
+      if (sitemapIndex) {
+        for (const child of locations.slice(0, 3)) {
+          try {
+            const childResult = await fetchPublicPage(child, MAX_XML_BYTES);
+
+            if (childResult.status < 400) {
+              const childUrls = [...childResult.text.matchAll(/<loc\b[^>]*>([\s\S]*?)<\/loc>/gi)]
+                .map(match => decodeXml(match[1].trim()))
+                .filter(value => isSafePublicUrl(value));
+
+              urls.push(...childUrls);
+            }
+          } catch (_) {}
+        }
+      } else {
+        urls.push(...locations);
+      }
+
+      if (urls.length) break;
+    } catch (_) {}
+  }
+
+  const unique = [...new Set(urls)].filter(value => {
+    try {
+      return new URL(value).hostname === new URL(origin).hostname;
+    } catch (_) {
+      return false;
+    }
+  });
+
+  return {
+    available: sitemapAvailable,
+    totalUrlsFound: unique.length,
+    urls: unique.slice(0, MAX_PAGES),
+    notice: sitemapAvailable
+      ? "Public sitemap retrieved. URL count reflects the sitemap entries inspected."
+      : "No accessible XML sitemap was found."
+  };
+}
+
+function buildAudit(pages, robots, sitemap) {
+  const findings = [];
+
+  if (!pages.length) {
+    findings.push("No crawlable HTML pages were available for inspection.");
+  }
+
+  const homepage = pages[0];
+
+  if (homepage) {
+    if (!homepage.title) findings.push("Homepage is missing a title tag.");
+    else if (homepage.titleLength < 15 || homepage.titleLength > 60) {
+      findings.push("Homepage title length is outside the commonly recommended 15–60 character range.");
+    }
+
+    if (!homepage.description) findings.push("Homepage is missing a meta description.");
+    else if (homepage.descriptionLength < 70 || homepage.descriptionLength > 160) {
+      findings.push("Homepage meta description length is outside the commonly recommended 70–160 character range.");
+    }
+
+    if (homepage.h1Count === 0) findings.push("Homepage has no H1 heading.");
+    if (homepage.h1Count > 1) findings.push("Homepage has more than one H1 heading.");
+    if (!homepage.canonical) findings.push("Homepage has no detected canonical link.");
+    if (!homepage.viewport) findings.push("Homepage has no detected viewport meta tag.");
+    if (homepage.noindex) findings.push("Homepage contains a noindex directive.");
+    if (homepage.imagesWithoutAlt > 0) {
+      findings.push(homepage.imagesWithoutAlt + " homepage image(s) have no detected alt text.");
+    }
+  }
+
+  if (!robots.available) findings.push("robots.txt could not be retrieved.");
+  if (!sitemap.available) findings.push("No accessible sitemap was detected.");
+
+  const totalImages = pages.reduce((sum, p) => sum + p.imageCount, 0);
+  const missingAlt = pages.reduce((sum, p) => sum + p.imagesWithoutAlt, 0);
+  const indexedPages = pages.filter(p => !p.noindex).length;
+
+  return {
+    pagesChecked: pages.length,
+    successfulPages: pages.filter(p => p.status >= 200 && p.status < 400).length,
+    homepageStatus: homepage ? homepage.status : null,
+    titlePresent: homepage ? Boolean(homepage.title) : null,
+    descriptionPresent: homepage ? Boolean(homepage.description) : null,
+    h1Count: homepage ? homepage.h1Count : null,
+    canonicalPresent: homepage ? Boolean(homepage.canonical) : null,
+    viewportPresent: homepage ? homepage.viewport : null,
+    robotsAvailable: robots.available,
+    sitemapAvailable: sitemap.available,
+    sitemapUrlCount: sitemap.totalUrlsFound,
+    imagesChecked: totalImages,
+    imagesMissingAlt: missingAlt,
+    pagesWithoutNoindex: indexedPages,
+    findings
   };
 }
 
@@ -251,393 +477,138 @@ async function kvPut(env, key, value, ttl) {
   if (!env.TRAFFIC_HISTORY) return false;
 
   try {
-    await env.TRAFFIC_HISTORY.put(
-      key,
-      JSON.stringify(value),
-      { expirationTtl: ttl }
-    );
+    await env.TRAFFIC_HISTORY.put(key, JSON.stringify(value), {
+      expirationTtl: ttl
+    });
     return true;
   } catch (_) {
     return false;
   }
 }
 
-function rowsFrom(data, names) {
-  for (const name of names) {
-    if (Array.isArray(data?.[name])) return data[name];
-  }
-  return [];
-}
+async function analyzeDomain(domain, env) {
+  const saved = await kvGet(env, CACHE_PREFIX + domain);
 
-async function getSavedReport(env, domain, stale = false) {
-  const key = stale
-    ? STALE_PREFIX + domain
-    : CACHE_PREFIX + domain;
-
-  const saved = await kvGet(env, key);
-
-  if (!saved?.ok || saved.domain !== domain) return null;
-
-  saved.history =
-    (await kvGet(env, HISTORY_PREFIX + domain)) ||
-    saved.history ||
-    [];
-
-  saved.cached = true;
-
-  if (stale) {
-    saved.stale = true;
-    saved.staleNotice =
-      "Live data could not be refreshed. Showing the last successfully saved report. The figures may be older than 30 days.";
+  if (saved && saved.ok && saved.domain === domain) {
+    return { ...saved, cached: true };
   }
 
-  return saved;
-}
+  const origin = "https://" + domain;
+  const homepageResponse = await fetchPublicPage(origin);
 
-// ======================================================
-// GLOBAL DAILY BUDGET PROTECTION
-// Uses D1 database binding: DB
-// ======================================================
-
-async function reserveDailyBudget(env) {
-  if (!env.DB) {
-    return {
-      ok: false,
-      reason: "Daily budget protection is unavailable because the D1 DB binding is missing."
-    };
+  if (
+    homepageResponse.status < 200 ||
+    homepageResponse.status >= 400 ||
+    !/html|xhtml/i.test(homepageResponse.contentType)
+  ) {
+    throw new Error("The website did not return a successful HTML homepage.");
   }
 
-  const day = new Date().toISOString().slice(0, 10);
-  const now = new Date().toISOString();
+  const homepage = analyzeHtml(
+    homepageResponse.text,
+    homepageResponse.url,
+    homepageResponse.status,
+    homepageResponse.headers
+  );
 
-  try {
-    const row = await env.DB.prepare(`
-      INSERT INTO api_daily_budget
-        (day, reserved_cents, analyses, updated_at)
-      VALUES (?, ?, 1, ?)
-      ON CONFLICT(day) DO UPDATE SET
-        reserved_cents = reserved_cents + excluded.reserved_cents,
-        analyses = analyses + 1,
-        updated_at = excluded.updated_at
-      WHERE api_daily_budget.reserved_cents + excluded.reserved_cents <= ?
-        AND api_daily_budget.analyses < ?
-      RETURNING reserved_cents, analyses
-    `).bind(
-      day,
-      ANALYSIS_RESERVE_CENTS,
-      now,
-      DAILY_BUDGET_CENTS,
-      DAILY_ANALYSIS_LIMIT
-    ).first();
+  const robots = await getRobots(domain, origin);
+  const sitemap = await getSitemap(origin, robots.sitemaps);
 
-    if (!row) {
-      return {
-        ok: false,
-        reason: "Daily public analysis limit reached. Please try again tomorrow."
-      };
-    }
+  const pageUrls = sitemap.urls
+    .filter(url => url !== homepageResponse.url)
+    .slice(0, MAX_PAGES - 1);
 
-    return {
-      ok: true,
-      reservedCents: row.reserved_cents,
-      analyses: row.analyses
-    };
+  const pageResults = await Promise.all(
+    pageUrls.map(async pageUrl => {
+      try {
+        const response = await fetchPublicPage(pageUrl);
 
-  } catch (error) {
-    return {
-      ok: false,
-      reason: "Daily budget database error. New analysis is paused to protect API credits."
-    };
-  }
-}
-
-async function analyzeDomain(request, env) {
-  const url = new URL(request.url);
-  let domain;
-
-  try {
-    domain = normalizePublicDomain(url.searchParams.get("domain") || "");
-  } catch (e) {
-    return json({ ok: false, error: e.message }, 400);
-  }
-
-  const cacheKey = CACHE_PREFIX + domain;
-
-  // The Durable Object also stores a persistent copy.
-  // This KV check is an additional cache layer.
-  const cached = await getSavedReport(env, domain, false);
-
-  if (cached) return json(cached);
-
-  const staleReport = await getSavedReport(env, domain, true);
-
-  if (!env.YEPAPI_API_KEY) {
-    if (staleReport) return json(staleReport);
-
-    return json({
-      ok: false,
-      domain,
-      error: "This domain has no saved report yet. Live analysis is temporarily unavailable because the YepAPI key is not configured."
-    }, 503);
-  }
-
-  // Reserve budget only after checking saved reports.
-  // Cached reports do not consume the daily analysis allowance.
-  const budget = await reserveDailyBudget(env);
-
-  if (!budget.ok) {
-    if (staleReport) return json(staleReport);
-
-    return json({
-      ok: false,
-      domain,
-      error: budget.reason
-    }, 429);
-  }
-
-  try {
-    // Mandatory whole-domain metrics request.
-    const metricsRaw = await yepPost(
-      env,
-      "/v1/seo/domain/metrics",
-      { domain }
-    );
-
-    const metricsData = unwrap(metricsRaw);
-    const domainMetrics = metricsData.domainMetrics || {};
-    const pageMetrics = metricsData.page || {};
-
-    if (!metricsData.domainMetrics) {
-      throw new Error(
-        "YepAPI Domain Metrics response did not contain domainMetrics. Please check the API response and account access."
-      );
-    }
-
-    // Optional report sections.
-    // Vaneform failure does not stop the YepAPI report.
-    const [
-      keywordsRaw,
-      pagesRaw,
-      rankRaw,
-      vaneformRaw
-    ] = await Promise.all([
-      yepPost(
-        env,
-        "/v1/seo/domain/keywords",
-        {
-          domain,
-          limit: 100,
-          offset: 0,
-          location_code: 2840,
-          language: "en"
+        if (
+          response.status < 200 ||
+          response.status >= 400 ||
+          !/html|xhtml/i.test(response.contentType)
+        ) {
+          return null;
         }
-      ).catch(e => ({ _optionalError: e.message })),
 
-      yepPost(
-        env,
-        "/v1/seo/domain/pages",
-        {
-          domain,
-          limit: 5,
-          offset: 0,
-          location_code: 2840,
-          language: "en"
-        }
-      ).catch(e => ({ _optionalError: e.message })),
+        return analyzeHtml(
+          response.text,
+          response.url,
+          response.status,
+          response.headers
+        );
+      } catch (_) {
+        return null;
+      }
+    })
+  );
 
-      yepPost(
-        env,
-        "/v1/seo/domain/rank-overview",
-        {
-          domain,
-          location: "us",
-          language: "en"
-        }
-      ).catch(e => ({ _optionalError: e.message })),
+  const pagesChecked = [
+    homepage,
+    ...pageResults.filter(Boolean)
+  ];
 
-      vaneformGet(env, domain).catch(e => ({
-        available: false,
-        countries: [],
-        totalVisits: null,
-        estimate: null,
-        confidence: null,
-        asOf: null,
-        month: null,
-        reportUrl: null,
-        _optionalError: e.message,
-        notice:
-          "Vaneform country traffic data is temporarily unavailable. No country figures have been invented."
-      }))
-    ]);
+  const technicalAudit = buildAudit(pagesChecked, robots, sitemap);
 
-    const traffic = safeNumber(domainMetrics.traffic);
-    const keywordCount = safeNumber(domainMetrics.organicKeywords);
-    const trafficValue = safeNumber(domainMetrics.trafficValue);
-    const domainRating = safeNumber(domainMetrics.domainRating);
-    const urlRating = safeNumber(pageMetrics.urlRating);
+  const result = {
+    ok: true,
+    domain,
+    checkedAt: new Date().toISOString(),
 
-    const keywordData = unwrap(keywordsRaw);
+    overview: {
+      organicTraffic: null,
+      organicKeywords: null,
+      trafficValue: null,
+      domainRating: null,
+      urlRating: null,
+      positions: {
+        top1: null,
+        top3: null,
+        top10: null
+      }
+    },
 
-    const rawKeywords = rowsFrom(
-      keywordData,
-      ["keywords", "items", "results"]
-    );
+    keywords: [],
+    countries: [],
 
-    const keywords = rawKeywords
-      .map(k => ({
-        keyword: String(k.keyword ?? k.query ?? "").slice(0, 300),
-        position: safeNumber(k.position ?? k.rank),
-        searchVolume: safeNumber(
-          k.volume ?? k.searchVolume ?? k.search_volume
-        ),
-        estimatedTraffic: safeNumber(k.traffic ?? k.etv),
-        url: String(k.url ?? "").slice(0, 1500)
-      }))
-      .filter(k => k.keyword)
-      .sort((a, b) => (a.position ?? 99999) - (b.position ?? 99999))
-      .slice(0, 5);
+    countryNotice:
+      "No genuine public country-traffic data source is connected. Country traffic is shown as No Data.",
 
-    const pageData = unwrap(pagesRaw);
+    countrySource: "No Data",
 
-    const rawPages = rowsFrom(
-      pageData,
-      ["pages", "items", "results"]
-    );
+    countryTraffic: {
+      available: false,
+      totalVisits: null
+    },
 
-    const pages = rawPages
-      .map(p => ({
-        url: String(p.url ?? p.page ?? "").slice(0, 1500),
-        estimatedTraffic: safeNumber(p.traffic ?? p.etv)
-      }))
-      .filter(p => p.url)
-      .slice(0, 5);
+    keywordLocation: null,
+    pageLocation: null,
 
-    const rankData = unwrap(rankRaw);
-    const organic = rankData.organic || rankData;
-    const pos = organic.positions || rankData.positions || {};
+    pages: pagesChecked.slice(0, 5).map(page => ({
+      url: page.url,
+      estimatedTraffic: null
+    })),
 
-    const top1 = safeNumber(pos.pos1);
-    const top3 = safeNumber(pos.pos2_3);
-    const top10 = safeNumber(pos.pos4_10);
+    history: [],
 
-    let history =
-      (await kvGet(env, HISTORY_PREFIX + domain)) || [];
+    technicalAudit,
+    robots,
+    sitemap,
+    pageDetails: pagesChecked,
 
-    const today = new Date().toISOString().slice(0, 10);
+    source: "Public website HTML + robots.txt + XML sitemap",
 
-    if (traffic !== null) {
-      const index = history.findIndex(item => item.date === today);
-      const snapshot = { date: today, traffic };
+    estimateNotice:
+      "This free report inspects publicly accessible website pages, robots.txt and XML sitemaps. Public website files do not reveal a site's actual Google organic traffic, keyword rankings, search volumes, traffic value or visitor country distribution. These metrics are therefore shown as No Data. Discovered sitemap pages are not traffic-ranked pages. No traffic, rankings, visits or historical values have been invented.",
 
-      if (index >= 0) history[index] = snapshot;
-      else history.push(snapshot);
+    cached: false,
+    stale: false
+  };
 
-      history = history
-        .sort((a, b) => a.date.localeCompare(b.date))
-        .slice(-90);
+  await kvPut(env, CACHE_PREFIX + domain, result, CACHE_TTL);
 
-      await kvPut(
-        env,
-        HISTORY_PREFIX + domain,
-        history,
-        HISTORY_TTL
-      );
-    }
-
-    const result = {
-      ok: true,
-      domain,
-      checkedAt: new Date().toISOString(),
-
-      overview: {
-        organicTraffic: traffic,
-        organicKeywords: keywordCount,
-        trafficValue,
-        domainRating,
-        urlRating,
-        positions: {
-          top1,
-          top3,
-          top10
-        }
-      },
-
-      keywords,
-      pages,
-
-      // Vaneform country-level estimated visits.
-      // These are separate from YepAPI organic traffic.
-      countries: vaneformRaw.countries || [],
-
-      countryNotice:
-        vaneformRaw.notice ||
-        "Country traffic distribution is not available.",
-
-      countrySource: "Vaneform",
-
-      countryTraffic: {
-        available: Boolean(vaneformRaw.available),
-        totalVisits: vaneformRaw.totalVisits ?? null,
-        estimate: vaneformRaw.estimate ?? null,
-        confidence: vaneformRaw.confidence ?? null,
-        asOf: vaneformRaw.asOf ?? null,
-        month: vaneformRaw.month ?? null,
-        reportUrl: vaneformRaw.reportUrl ?? null
-      },
-
-      keywordLocation: "United States",
-      pageLocation: "United States",
-
-      history,
-
-      source:
-        "YepAPI Domain Metrics + Domain Keywords + Domain Pages + Vaneform Country Distribution",
-
-      estimateNotice:
-        "Domain organic traffic is the provider's whole-domain monthly estimate from YepAPI Domain Metrics. Keyword positions, keyword search volumes and top-page traffic are US-location estimates from YepAPI. Country distribution and estimated monthly country visits are supplied separately by Vaneform. Country visit figures are calculated from Vaneform's monthly visits multiplied by its reported country shares. Vaneform's estimate scope may be site or search, as identified in its source data. These are third-party estimates, not verified Google Analytics visits or private Google Search Console measurements. Vaneform country visits must not be added to or confused with YepAPI organic traffic. Search volume is separate from estimated organic traffic. Missing provider values are shown as No Data. Genuine zero values remain 0.",
-
-      optionalWarnings: [
-        keywordsRaw._optionalError,
-        pagesRaw._optionalError,
-        rankRaw._optionalError,
-        vaneformRaw._optionalError
-      ].filter(Boolean),
-
-      cached: false,
-      stale: false
-    };
-
-    // Save the fresh report and the one-year backup.
-    await Promise.all([
-      kvPut(env, cacheKey, result, CACHE_TTL),
-      kvPut(env, STALE_PREFIX + domain, result, STALE_TTL)
-    ]);
-
-    return json(result);
-
-  } catch (e) {
-    if (staleReport) return json(staleReport);
-
-    const message = String(
-      e?.message || "Domain analysis failed."
-    ).slice(0, 400);
-
-    const creditProblem =
-      /credit|balance|quota|insufficient|payment|limit exceeded/i.test(message);
-
-    return json({
-      ok: false,
-      domain,
-      error: creditProblem
-        ? "Live analysis is temporarily unavailable because the SEO data provider has no available credits. This domain has no previously saved report yet."
-        : message
-    }, 502);
-  }
+  return result;
 }
-
-// ======================================================
-// DURABLE OBJECT: one serialized analysis queue per domain
-// ======================================================
 
 export class DomainLock {
   constructor(state, env) {
@@ -665,52 +636,35 @@ export class DomainLock {
     let domain;
 
     try {
-      domain = normalizePublicDomain(
-        url.searchParams.get("domain") || ""
-      );
-    } catch (e) {
-      return json({ ok: false, error: e.message }, 400);
+      domain = normalizePublicDomain(url.searchParams.get("domain") || "");
+    } catch (error) {
+      return json({ ok: false, error: error.message }, 400);
     }
 
-    const saved = await this.state.storage.get("freshReport");
+    const key = "report:" + domain;
+    const saved = await this.state.storage.get(key);
 
-    if (
-      saved &&
-      saved.domain === domain &&
-      saved.expiresAt > Date.now() &&
-      saved.report?.ok
-    ) {
-      const report = { ...saved.report, cached: true, stale: false };
-
-      report.history =
-        (await kvGet(this.env, HISTORY_PREFIX + domain)) ||
-        report.history ||
-        [];
-
-      return json(report);
+    if (saved && saved.expiresAt > Date.now() && saved.report?.ok) {
+      return json({ ...saved.report, cached: true });
     }
 
-    if (saved) {
-      await this.state.storage.delete("freshReport");
-    }
+    try {
+      const report = await analyzeDomain(domain, this.env);
 
-    const response = await analyzeDomain(request, this.env);
-    const result = await response.clone().json().catch(() => null);
-
-    if (
-      response.ok &&
-      result?.ok === true &&
-      result?.stale !== true
-    ) {
-      await this.state.storage.put("freshReport", {
-        domain,
+      await this.state.storage.put(key, {
         savedAt: Date.now(),
         expiresAt: Date.now() + CACHE_TTL * 1000,
-        report: result
+        report
       });
-    }
 
-    return response;
+      return json(report);
+    } catch (error) {
+      return json({
+        ok: false,
+        domain,
+        error: String(error?.message || "Website analysis failed.").slice(0, 400)
+      }, 502);
+    }
   }
 }
 
@@ -718,34 +672,20 @@ async function healthCheck(env) {
   return json({
     ok: true,
     worker: "IRFAN Traffic Intelligence",
-    version: "11.0-vaneform-country-traffic",
-
+    version: "12.0-free-public-audit",
     publicDashboard: true,
     publicAnalyzer: true,
-
     googleLoginRequired: false,
     googleSearchConsole: false,
-    trackeeConfigured: false,
-
-    yepapiConfigured: Boolean(env.YEPAPI_API_KEY),
-    vaneformConfigured: Boolean(env.VANEFORM_API_KEY),
-
+    paidProvidersRequired: false,
     kvConfigured: Boolean(env.TRAFFIC_HISTORY),
     durableObjectConfigured: Boolean(env.DOMAIN_LOCKS),
-    d1Configured: Boolean(env.DB),
-
-    dailyBudgetLimitUSD: DAILY_BUDGET_CENTS / 100,
-    perAnalysisReserveUSD: ANALYSIS_RESERVE_CENTS / 100,
-    dailyAnalysisLimit: DAILY_ANALYSIS_LIMIT,
-
-    cacheDurationDays: 30,
-    backupDurationDays: 365,
-
-    dataSource:
-      "YepAPI Domain Metrics (whole-domain organic traffic) + Domain Keywords (US rankings) + Domain Pages (US page estimates) + Vaneform (estimated monthly visits and country distribution)",
-
+    dailyAnalysisLimit: null,
+    artificialDailyLimit: false,
+    cacheDurationHours: 24,
+    dataSource: "Public website HTML + robots.txt + XML sitemap",
     trafficPolicy:
-      "Global D1 daily budget reservation, per-domain Durable Object serialization and persistent 30-day report cache. Successful reports are reused by all visitors. YepAPI organic traffic and Vaneform country visit estimates are kept separate. Country estimates are never presented as verified Google Analytics or Google Search Console traffic. Genuine zero values are preserved."
+      "No paid SEO API, private Search Console, fabricated traffic, invented rankings, search volume, country visits or historical values. Missing metrics are returned as null."
   });
 }
 
@@ -755,7 +695,7 @@ function htmlResponse(html) {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-cache",
       "content-security-policy":
-        "default-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; connect-src 'self' https://api.yepapi.com https://vaneform.com; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com"
+        "default-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; connect-src 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com"
     }
   });
 }
@@ -786,18 +726,16 @@ export default {
       if (!env.DOMAIN_LOCKS) {
         return json({
           ok: false,
-          error: "DOMAIN_LOCKS Durable Object binding is missing. Configure the binding before using the public analyzer."
+          error: "DOMAIN_LOCKS Durable Object binding is missing. Configure it in Cloudflare Worker settings."
         }, 503);
       }
 
       let domain;
 
       try {
-        domain = normalizePublicDomain(
-          url.searchParams.get("domain") || ""
-        );
-      } catch (e) {
-        return json({ ok: false, error: e.message }, 400);
+        domain = normalizePublicDomain(url.searchParams.get("domain") || "");
+      } catch (error) {
+        return json({ ok: false, error: error.message }, 400);
       }
 
       const id = env.DOMAIN_LOCKS.idFromName(domain);
@@ -819,8 +757,7 @@ export default {
 };
 
 // ======================================================
-// ORIGINAL IRFAN TRAFFIC INTELLIGENCE DASHBOARD
-// Design and layout preserved.
+// IRFAN TRAFFIC INTELLIGENCE — ORIGINAL DASHBOARD DESIGN
 // ======================================================
 
 const APP_HTML = `<!doctype html>
@@ -829,7 +766,7 @@ const APP_HTML = `<!doctype html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>IRFAN Traffic Intelligence</title>
-<meta name="description" content="IRFAN Traffic Intelligence — professional SEO analytics and public domain analysis.">
+<meta name="description" content="IRFAN Traffic Intelligence — free public website and technical SEO analysis.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -932,9 +869,14 @@ td a:hover{text-decoration:underline}
 .chart-legend{display:flex;gap:14px;align-items:center;font-size:11px;color:#64748b;margin-top:4px}
 .chart-legend i{display:inline-block;width:18px;height:3px;border-radius:3px;background:#087de5;vertical-align:middle;margin-right:5px}
 .chart-legend .legend-dot{width:8px;height:8px;border-radius:50%;background:#20c997;display:inline-block;margin-right:5px}
+.audit-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:12px}
+.audit-item{background:#f1f5f9;padding:11px;border-radius:5px}
+.audit-item strong{display:block;font-size:19px;color:#0f2745}
+.audit-item span{font-size:12px;color:#64748b}
+.audit-findings{padding-left:18px;margin:8px 0;color:#475569;font-size:13px;line-height:1.7}
 .hidden{display:none!important}
 @media(max-width:950px){.sidebar{width:190px}.metrics{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}.report-top{grid-template-columns:1fr}.report-lower{grid-template-columns:1fr 1fr}}
-@media(max-width:650px){.sidebar{display:none}main{padding:13px}h1{font-size:22px}.metrics{gap:8px}.metric{padding:12px}.metric .value{font-size:22px}.panel{padding:13px}.sitebox input{font-size:14px}.report-overlay{padding:0}.report-sheet{max-height:100vh;border-radius:0;padding:22px 15px}.report-title{font-size:26px}.report-number strong{font-size:40px}.report-number .money{font-size:30px}.report-lower{grid-template-columns:1fr;gap:20px}.report-chart{height:210px}.rating-box{gap:15px;flex-wrap:wrap}}
+@media(max-width:650px){.sidebar{display:none}main{padding:13px}h1{font-size:22px}.metrics{gap:8px}.metric{padding:12px}.metric .value{font-size:22px}.panel{padding:13px}.sitebox input{font-size:14px}.report-overlay{padding:0}.report-sheet{max-height:100vh;border-radius:0;padding:22px 15px}.report-title{font-size:26px}.report-number strong{font-size:40px}.report-number .money{font-size:30px}.report-lower{grid-template-columns:1fr;gap:20px}.report-chart{height:210px}.rating-box{gap:15px;flex-wrap:wrap}.audit-grid{grid-template-columns:repeat(2,1fr)}}
 </style>
 </head>
 <body>
@@ -957,7 +899,7 @@ td a:hover{text-decoration:underline}
 <header class="header">
   <div>
     <h1>IRFAN Traffic Intelligence</h1>
-    <div class="sub">PROFESSIONAL SEO ANALYTICS · YEPAPI + VANEFORM DATA</div>
+    <div class="sub">PROFESSIONAL SEO ANALYTICS · FREE PUBLIC WEBSITE DATA</div>
   </div>
   <div style="display:flex;align-items:center;gap:10px">
     <span class="status" id="systemStatus">● PUBLIC ANALYZER</span>
@@ -969,9 +911,9 @@ td a:hover{text-decoration:underline}
   <div class="section-title">
     <div>
       <h2>Domain Analyzer</h2>
-      <div class="small">Analyze any public website · No Google login required</div>
+      <div class="small">Analyze any public website · No login or paid API required</div>
     </div>
-    <span class="status">● YEPAPI + VANEFORM DATA</span>
+    <span class="status">● FREE PUBLIC DATA</span>
   </div>
   <div class="sitebox">
     <input id="publicDomain" type="text" placeholder="Enter website domain, e.g. example.com" autocomplete="url" aria-label="Website domain">
@@ -983,19 +925,19 @@ td a:hover{text-decoration:underline}
 <div id="publicReport" class="report-overlay hidden" role="dialog" aria-modal="true" aria-label="Domain analysis report">
  <section class="report-sheet">
   <button class="report-close" id="closePublicReport" aria-label="Close report">×</button>
-  <h2 class="report-title" id="pubTitle">Organic traffic of domain</h2>
-  <div class="report-subtitle">Domain including subdomains</div>
+  <h2 class="report-title" id="pubTitle">Public website analysis</h2>
+  <div class="report-subtitle">Public website data · Technical SEO inspection</div>
 
   <div class="report-top">
    <div>
     <div class="report-numbers">
      <div class="report-number">
-       <label>Organic traffic <span title="Third-party estimate">ⓘ</span></label>
-       <strong id="pubTraffic">—</strong>
+       <label>Organic traffic <span title="Not available from public website files">ⓘ</span></label>
+       <strong id="pubTraffic">No Data</strong>
      </div>
      <div class="report-number">
-       <label>Traffic value <span title="Estimated monetary value">ⓘ</span></label>
-       <strong class="money" id="pubValue">—</strong>
+       <label>Traffic value <span title="Not available from public website files">ⓘ</span></label>
+       <strong class="money" id="pubValue">No Data</strong>
      </div>
     </div>
 
@@ -1004,41 +946,41 @@ td a:hover{text-decoration:underline}
         <div class="rating-circle"></div>
         <div>
           <div class="rating-label">Domain<br>Rating</div>
-          <div class="rating-value" id="pubDR">—</div>
+          <div class="rating-value" id="pubDR">No Data</div>
         </div>
       </div>
       <div class="rating-item">
         <div class="rating-circle"></div>
         <div>
           <div class="rating-label">URL<br>Rating</div>
-          <div class="rating-value" id="pubUR">—</div>
+          <div class="rating-value" id="pubUR">No Data</div>
         </div>
       </div>
     </div>
-    <div class="rating-foot">Domain Rating and URL Rating are provider-supplied metrics.</div>
+    <div class="rating-foot">Public website files do not disclose traffic or third-party domain rating metrics.</div>
    </div>
 
    <div>
-     <svg id="pubTrafficChart" class="report-chart" viewBox="0 0 560 250" preserveAspectRatio="none" aria-label="Estimated organic visits history chart"></svg>
-     <div class="chart-legend"><span><i></i>Estimated organic visits</span><span><b class="legend-dot"></b>Latest estimate</span></div>
-     <div id="pubChartCaption" class="report-status">History will appear as dated snapshots become available.</div>
+     <svg id="pubTrafficChart" class="report-chart" viewBox="0 0 560 250" preserveAspectRatio="none" aria-label="Organic traffic history unavailable"></svg>
+     <div class="chart-legend"><span><i></i>Organic traffic</span><span><b class="legend-dot"></b>No Data</span></div>
+     <div id="pubChartCaption" class="report-status">No verified historical traffic data is available.</div>
    </div>
   </div>
 
   <div class="report-lower">
    <section class="report-section">
-     <h3>Top countries <span title="Estimated country distribution">ⓘ</span></h3>
-     <div class="country-scope"><span class="country-scope-dot"></span>Vaneform estimated monthly visits</div>
+     <h3>Top countries <span title="Country traffic is unavailable">ⓘ</span></h3>
+     <div class="country-scope"><span class="country-scope-dot"></span>Public country traffic data</div>
      <table class="report-table">
-       <thead><tr><th>Country</th><th class="num">Estimated Visits</th><th class="num">Share</th></tr></thead>
+       <thead><tr><th>Country</th><th class="num">Visits</th><th class="num">Share</th></tr></thead>
        <tbody id="pubCountryRows"><tr><td colspan="3" class="report-empty">No Data</td></tr></tbody>
      </table>
-     <div id="pubCountryNote" class="report-status">Country distribution is shown only when Vaneform supplies it.</div>
+     <div id="pubCountryNote" class="report-status">Public website files do not disclose visitor countries.</div>
    </section>
 
    <section class="report-section">
-     <h3>Top keywords <span title="US ranked keywords">ⓘ</span>
-       <span id="pubKeywordCountry" style="font-size:12px;font-weight:400;color:#64748b">(US rankings)</span>
+     <h3>Top keywords <span title="Keyword rankings are unavailable">ⓘ</span>
+       <span id="pubKeywordCountry" style="font-size:12px;font-weight:400;color:#64748b">(No ranking data)</span>
      </h3>
      <table class="report-table">
        <thead><tr><th>Keyword</th><th class="num">Position</th><th class="num">Volume</th><th class="num">Traffic</th></tr></thead>
@@ -1048,13 +990,19 @@ td a:hover{text-decoration:underline}
   </div>
 
   <section class="report-section report-pages">
-    <h3>Top 5 articles / pages <span style="float:right;font-size:13px">US estimated monthly traffic</span></h3>
+    <h3>Discovered pages <span style="float:right;font-size:13px">Traffic: No Data</span></h3>
     <table class="report-table"><tbody id="pubPageRows"></tbody></table>
+  </section>
+
+  <section class="report-section report-pages">
+    <h3>Technical SEO Audit</h3>
+    <div class="audit-grid" id="reportAuditGrid"></div>
+    <ul class="audit-findings" id="reportAuditFindings"></ul>
   </section>
 
   <div class="report-note">
     <span class="info">i</span>
-    <span id="pubDisclaimer">Domain organic traffic is a YepAPI third-party estimate. Country distribution is a separate Vaneform estimate. Neither represents verified Google Analytics or private Google Search Console data.</span>
+    <span id="pubDisclaimer">Public website data cannot reveal actual Google organic traffic, keyword rankings, search volume or country visits. Missing metrics are shown as No Data.</span>
   </div>
   <div class="report-status" id="pubCheckedAt"></div>
  </section>
@@ -1065,7 +1013,7 @@ td a:hover{text-decoration:underline}
     <div class="section-title">
       <div>
         <h2>Domain Performance Overview</h2>
-        <div class="small" id="dashboardDomain">Analyze any public website to load its SEO metrics.</div>
+        <div class="small" id="dashboardDomain">Analyze any public website to load its public SEO data.</div>
       </div>
       <span class="status">● PUBLIC SEO DATA</span>
     </div>
@@ -1073,23 +1021,23 @@ td a:hover{text-decoration:underline}
     <div class="metrics">
       <div class="metric">
         <div class="label">ESTIMATED ORGANIC TRAFFIC</div>
-        <div class="value" id="dashTraffic">—</div>
-        <div class="hint">Whole-domain monthly organic estimate</div>
+        <div class="value" id="dashTraffic">No Data</div>
+        <div class="hint">Not disclosed by public website files</div>
       </div>
       <div class="metric">
         <div class="label">ORGANIC KEYWORDS</div>
-        <div class="value" id="dashKeywords">—</div>
-        <div class="hint">Whole-domain provider estimate</div>
+        <div class="value" id="dashKeywords">No Data</div>
+        <div class="hint">Rankings not publicly disclosed</div>
       </div>
       <div class="metric">
         <div class="label">ESTIMATED TRAFFIC VALUE</div>
-        <div class="value" id="dashValue">—</div>
-        <div class="hint">Provider traffic cost estimate</div>
+        <div class="value" id="dashValue">No Data</div>
+        <div class="hint">No public traffic-value source</div>
       </div>
       <div class="metric">
-        <div class="label">TOP 10 RANKINGS</div>
-        <div class="value" id="dashTop10">—</div>
-        <div class="hint">US position distribution</div>
+        <div class="label">PAGES CHECKED</div>
+        <div class="value" id="dashTop10">No Data</div>
+        <div class="hint">Public HTML pages inspected</div>
       </div>
     </div>
   </section>
@@ -1097,23 +1045,23 @@ td a:hover{text-decoration:underline}
   <section class="panel">
     <div class="section-title">
       <h2>Estimated Organic Visits History</h2>
-      <span class="small">Saved dated snapshots · monthly estimate</span>
+      <span class="small">No verified traffic history source</span>
     </div>
-    <svg id="dashboardChart" class="chart" viewBox="0 0 700 210" preserveAspectRatio="none" aria-label="Estimated organic visits history chart"></svg>
-    <div class="chart-legend"><span><i></i>Estimated organic visits</span><span><b class="legend-dot"></b>Latest estimate</span></div>
-    <div class="small" id="dashboardChartNote">History will appear after dated domain analyses are saved.</div>
+    <svg id="dashboardChart" class="chart" viewBox="0 0 700 210" preserveAspectRatio="none" aria-label="Organic traffic history unavailable"></svg>
+    <div class="chart-legend"><span><i></i>Organic traffic</span><span><b class="legend-dot"></b>No Data</span></div>
+    <div class="small" id="dashboardChartNote">No historical traffic values are invented or displayed.</div>
   </section>
 
   <div class="grid">
     <section class="panel" id="dashboardKeywords">
       <div class="section-title">
         <h2>Top 5 Organic Keywords</h2>
-        <span class="small">US position · Search volume · Traffic</span>
+        <span class="small">Position · Search volume · Traffic</span>
       </div>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Keyword</th><th>Position</th><th>Search Volume</th><th>Traffic</th></tr></thead>
-          <tbody id="dashboardKeywordRows"><tr><td colspan="4" class="empty">Analyze a domain to load keyword data.</td></tr></tbody>
+          <tbody id="dashboardKeywordRows"><tr><td colspan="4" class="empty">No public keyword ranking data.</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -1121,41 +1069,56 @@ td a:hover{text-decoration:underline}
     <section class="panel" id="dashboardCountries">
       <div class="section-title">
         <h2>Top Countries</h2>
-        <span class="small">Vaneform estimated visits</span>
+        <span class="small">Visitor traffic distribution</span>
       </div>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Country</th><th>Estimated Visits</th><th>Traffic Share</th></tr></thead>
-          <tbody id="dashboardCountryRows"><tr><td colspan="3" class="empty">No country data available.</td></tr></tbody>
+          <tbody id="dashboardCountryRows"><tr><td colspan="3" class="empty">No country traffic data.</td></tr></tbody>
         </table>
       </div>
-      <p class="small" id="dashboardCountryNote">Country distribution is supplied separately by Vaneform and is not verified Google traffic.</p>
+      <p class="small" id="dashboardCountryNote">Country traffic is not disclosed by public website files.</p>
     </section>
   </div>
 
   <section class="panel" id="dashboardPages">
     <div class="section-title">
-      <h2>Top 5 Articles / Pages</h2>
-      <span class="small">US estimated monthly page traffic</span>
+      <h2>Discovered Articles / Pages</h2>
+      <span class="small">Sitemap URLs · Traffic unavailable</span>
     </div>
     <div class="table-wrap">
       <table>
         <thead><tr><th>#</th><th>Article / Page URL</th><th>Estimated Traffic</th></tr></thead>
-        <tbody id="dashboardPageRows"><tr><td colspan="3" class="empty">Analyze a domain to load top pages.</td></tr></tbody>
+        <tbody id="dashboardPageRows"><tr><td colspan="3" class="empty">Analyze a domain to discover public pages.</td></tr></tbody>
       </table>
     </div>
   </section>
 
   <section class="panel">
     <div class="section-title">
-      <h2>Visits / Sessions</h2>
-      <span class="small">Provider availability</span>
+      <h2>Technical SEO Audit</h2>
+      <span class="small">Public pages · robots.txt · XML sitemap</span>
     </div>
-    <div class="empty">YepAPI SEO database does not provide verified website sessions or analytics visits. The history chart above shows estimated organic visits from the provider's organic traffic metric, not verified Analytics sessions.</div>
+    <div class="audit-grid" id="dashboardAuditGrid">
+      <div class="audit-item"><strong>—</strong><span>Pages checked</span></div>
+      <div class="audit-item"><strong>—</strong><span>Images checked</span></div>
+      <div class="audit-item"><strong>—</strong><span>Missing image alt</span></div>
+    </div>
+    <ul class="audit-findings" id="dashboardAuditFindings">
+      <li>Analyze a website to see technical SEO findings.</li>
+    </ul>
+  </section>
+
+  <section class="panel">
+    <div class="section-title">
+      <h2>Visits / Sessions</h2>
+      <span class="small">Public data availability</span>
+    </div>
+    <div class="empty">Verified website sessions and Analytics visits are private account data. This public analyzer does not invent or estimate them.</div>
   </section>
 </section>
 
-<div class="foot">IRFAN Traffic Intelligence · Public domain analysis · Source-backed estimates only.</div>
+<div class="foot">IRFAN Traffic Intelligence · Free public website analysis · Source-backed data only.</div>
 </main>
 </div>
 
@@ -1191,154 +1154,11 @@ function compactCount(value) {
   return String(Math.round(n));
 }
 
-function moneyValue(value) {
-  if (value === null || value === undefined || value === "" || !Number.isFinite(Number(value))) {
-    return "No Data";
-  }
-
-  return "$" + Number(value).toLocaleString("en-US", {
-    maximumFractionDigits: 2
-  });
-}
-
 function publicMessage(text, bad = false) {
   const el = $("publicMessage");
   el.textContent = text;
   el.classList.remove("hidden", "error");
   if (bad) el.classList.add("error");
-}
-
-function renderTrafficHistory(history, currentTraffic) {
-  const targets = [$("pubTrafficChart"), $("dashboardChart")];
-
-  const rows = Array.isArray(history)
-    ? history.filter(x =>
-        x.traffic !== null &&
-        x.traffic !== undefined &&
-        Number.isFinite(Number(x.traffic)) &&
-        Number(x.traffic) >= 0
-      )
-    : [];
-
-  const w = 560, h = 250, left = 12, right = 42, top = 18, bottom = 34;
-  const plotW = w - left - right;
-  const plotH = h - top - bottom;
-  let out = "";
-
-  if (rows.length < 2) {
-    const value = safeChartNumber(currentTraffic);
-    const y = top + plotH - (value > 0 ? plotH * 0.72 : 0);
-
-    out =
-      '<line class="gridline" x1="' + left + '" y1="' + (top + plotH) +
-      '" x2="' + (w - right) + '" y2="' + (top + plotH) +
-      '"/>' +
-      (value !== null
-        ? '<line x1="' + left + '" y1="' + y +
-          '" x2="' + (w - right - 5) + '" y2="' + y +
-          '" stroke="#087de5" stroke-width="3" stroke-linecap="round" stroke-dasharray="6 6" opacity=".75"/>' +
-          '<circle cx="' + (w - right - 5) + '" cy="' + y +
-          '" r="5" fill="#20c997" stroke="#ffffff" stroke-width="2"/>'
-        : "") +
-      '<text x="' + (w - right) + '" y="' + (h - 7) +
-      '" text-anchor="end">Latest</text><text x="' +
-      left + '" y="' + (top + plotH - 7) + '">' +
-      (value !== null ? esc(compactCount(value)) : "No Data") + "</text>";
-
-    $("pubChartCaption").textContent =
-      rows.length === 1
-        ? "One dated estimate is available. A real history trend will appear after more dated analyses."
-        : "Latest estimate shown. A real history trend will appear after multiple dated analyses.";
-
-    $("dashboardChartNote").textContent =
-      "The dashed line marks the latest estimate only. A historical trend requires multiple dated snapshots; no past values are invented.";
-  } else {
-    const vals = rows.map(x => Number(x.traffic));
-    const max = Math.max(1, ...vals) * 1.15;
-
-    const pts = rows.map((r, i) => ({
-      x: left + (plotW * i / (rows.length - 1)),
-      y: top + plotH - (Number(r.traffic) / max) * plotH,
-      label: r.date,
-      traffic: Number(r.traffic)
-    }));
-
-    const line = pts.map(p => p.x + "," + p.y).join(" ");
-    const area =
-      "M " + pts[0].x + " " + (top + plotH) +
-      " L " + line.replace(/ /g, " L ") +
-      " L " + pts[pts.length - 1].x + " " + (top + plotH) + " Z";
-
-    out =
-      '<defs><linearGradient id="trafficFill" x1="0" x2="0" y1="0" y2="1"><stop offset="0%" stop-color="#087de5" stop-opacity=".24"/><stop offset="100%" stop-color="#20c997" stop-opacity=".02"/></linearGradient></defs>';
-
-    for (let i = 0; i < 4; i++) {
-      const y = top + (plotH * i / 3);
-      out +=
-        '<line class="gridline" x1="' + left + '" y1="' + y +
-        '" x2="' + (w - right) + '" y2="' + y +
-        '"/><text x="' + (w - right + 7) + '" y="' + (y + 4) +
-        '">' + esc(compactCount(max * (1 - i / 3))) + "</text>";
-    }
-
-    out += '<path class="area" d="' + area + '"/><polyline class="trend" points="' + line + '"/>';
-
-    pts.forEach((p, i) => {
-      out +=
-        '<circle cx="' + p.x + '" cy="' + p.y +
-        '" r="4" fill="#20c997" stroke="#ffffff" stroke-width="1.5"><title>' +
-        esc(p.label) + ": " + compactCount(p.traffic) +
-        ' estimated organic visits</title></circle>';
-
-      if (i === 0 || i === pts.length - 1 || i === Math.floor(pts.length / 2)) {
-        out +=
-          '<text x="' + p.x + '" y="' + (h - 8) +
-          '" text-anchor="middle">' + esc(p.label) + "</text>";
-      }
-    });
-
-    $("pubChartCaption").textContent =
-      "Saved dated estimates · hover over chart points for estimated organic visits.";
-
-    $("dashboardChartNote").textContent =
-      "Saved daily whole-domain monthly organic traffic estimates, displayed as estimated organic visits.";
-  }
-
-  targets.forEach(svg => {
-    if (svg) svg.innerHTML = out;
-  });
-}
-
-function safeChartNumber(value) {
-  if (value === null || value === undefined || value === "") return null;
-  const n = Number(value);
-  return Number.isFinite(n) && n >= 0 ? n : null;
-}
-
-function renderKeywords(keywords) {
-  const rows = Array.isArray(keywords) ? keywords.slice(0, 5) : [];
-
-  $("pubKeywordRows").innerHTML = rows.length
-    ? rows.map(k =>
-        '<tr><td>' + esc(k.keyword) +
-        '</td><td class="num">' +
-        (k.position === null || k.position === undefined ? "—" : esc(k.position)) +
-        '</td><td class="num">' + compactCount(k.searchVolume) +
-        '</td><td class="num">' + compactCount(k.estimatedTraffic) +
-        "</td></tr>"
-      ).join("")
-    : '<tr><td colspan="4" class="report-empty">No ranked keyword data available.</td></tr>';
-
-  $("dashboardKeywordRows").innerHTML = rows.length
-    ? rows.map(k =>
-        "<tr><td>" + esc(k.keyword) +
-        "</td><td>" +
-        (k.position === null || k.position === undefined ? "—" : esc(k.position)) +
-        "</td><td>" + compactCount(k.searchVolume) +
-        "</td><td>" + compactCount(k.estimatedTraffic) +
-        "</td></tr>"
-      ).join("")
-    : '<tr><td colspan="4" class="empty">No ranked keyword data available.</td></tr>';
 }
 
 function safeLink(url) {
@@ -1349,142 +1169,127 @@ function safeLink(url) {
   return "";
 }
 
+function renderNoTrafficCharts() {
+  const message = '<text x="50%" y="48%" text-anchor="middle" fill="#94a3b8" font-size="15">No Data — public traffic history unavailable</text>';
+
+  $("pubTrafficChart").innerHTML = message;
+  $("dashboardChart").innerHTML = message;
+  $("pubChartCaption").textContent = "No verified historical traffic data is available.";
+  $("dashboardChartNote").textContent = "No historical traffic values are invented or displayed.";
+}
+
+function renderKeywords() {
+  $("pubKeywordRows").innerHTML =
+    '<tr><td colspan="4" class="report-empty">No public keyword ranking data available.</td></tr>';
+
+  $("dashboardKeywordRows").innerHTML =
+    '<tr><td colspan="4" class="empty">No public keyword ranking data available.</td></tr>';
+}
+
+function renderCountries() {
+  const message = "No public country traffic data available.";
+
+  $("pubCountryRows").innerHTML =
+    '<tr><td colspan="3" class="report-empty">No Data</td></tr>';
+
+  $("dashboardCountryRows").innerHTML =
+    '<tr><td colspan="3" class="empty">No Data</td></tr>';
+
+  $("pubCountryNote").textContent = message;
+  $("dashboardCountryNote").textContent = message;
+}
+
 function renderPages(pages) {
   const rows = Array.isArray(pages) ? pages.slice(0, 5) : [];
 
   $("pubPageRows").innerHTML = rows.length
     ? rows.map((p, i) => {
         const link = safeLink(p.url);
-        return '<tr><td>' + (i + 1) +
-          '</td><td>' +
+
+        return '<tr><td>' + (i + 1) + '</td><td>' +
           (link
             ? '<a href="' + esc(link) + '" target="_blank" rel="noopener noreferrer">' + esc(p.url) + '</a>'
             : esc(p.url || "—")) +
-          '</td><td class="num">' + compactCount(p.estimatedTraffic) + "</td></tr>";
+          '</td><td class="num">No Data</td></tr>';
       }).join("")
-    : '<tr><td colspan="3" class="report-empty">No page traffic data supplied by provider.</td></tr>';
+    : '<tr><td colspan="3" class="report-empty">No sitemap pages discovered.</td></tr>';
 
   $("dashboardPageRows").innerHTML = rows.length
     ? rows.map((p, i) => {
         const link = safeLink(p.url);
-        return "<tr><td>" + (i + 1) +
-          '</td><td>' +
+
+        return "<tr><td>" + (i + 1) + "</td><td>" +
           (link
             ? '<a href="' + esc(link) + '" target="_blank" rel="noopener noreferrer">' + esc(p.url) + '</a>'
             : esc(p.url || "—")) +
-          "</td><td>" + compactCount(p.estimatedTraffic) + "</td></tr>";
+          "</td><td>No Data</td></tr>";
       }).join("")
-    : '<tr><td colspan="3" class="empty">No page traffic data supplied by provider.</td></tr>';
+    : '<tr><td colspan="3" class="empty">No sitemap pages discovered.</td></tr>';
 }
 
-// ======================================================
-// COUNTRY RENDERING
-// ======================================================
+function renderAudit(audit) {
+  const a = audit || {};
 
-function renderCountries(countries, countryNotice) {
-  const rows = Array.isArray(countries) ? countries.slice(0, 5) : [];
+  const items = [
+    [a.pagesChecked ?? "—", "Pages checked"],
+    [a.successfulPages ?? "—", "Successful pages"],
+    [a.imagesChecked ?? "—", "Images checked"],
+    [a.imagesMissingAlt ?? "—", "Images missing alt"],
+    [a.sitemapUrlCount ?? "—", "Sitemap URLs found"],
+    [a.homepageStatus ?? "—", "Homepage HTTP status"]
+  ];
 
-  if (!rows.length) {
-    const message = countryNotice || "Country traffic data is not available.";
-
-    $("pubCountryRows").innerHTML =
-      '<tr><td colspan="3" class="report-empty">' +
-      esc(message) +
-      "</td></tr>";
-
-    $("dashboardCountryRows").innerHTML =
-      '<tr><td colspan="3" class="empty">' +
-      esc(message) +
-      "</td></tr>";
-
-    $("pubCountryNote").textContent = message;
-    $("dashboardCountryNote").textContent = message;
-
-    return;
-  }
-
-  const html = rows.map(c =>
-    "<tr><td>" + esc(c.country || "—") +
-    '</td><td class="num">' + compactCount(c.estimatedVisits) +
-    '</td><td class="num">' +
-    (c.sharePercent === null || c.sharePercent === undefined
-      ? "No Data"
-      : esc(c.sharePercent) + "%") +
-    "</td></tr>"
+  const html = items.map(item =>
+    '<div class="audit-item"><strong>' + esc(item[0]) +
+    '</strong><span>' + esc(item[1]) + "</span></div>"
   ).join("");
 
-  $("pubCountryRows").innerHTML = html;
-  $("dashboardCountryRows").innerHTML = html;
+  $("reportAuditGrid").innerHTML = html;
+  $("dashboardAuditGrid").innerHTML = html;
 
-  const note = countryNotice ||
-    "Country visits are third-party estimates supplied by Vaneform.";
+  const findings = Array.isArray(a.findings) ? a.findings : [];
+  const list = findings.length
+    ? findings.map(item => "<li>" + esc(item) + "</li>").join("")
+    : "<li>No issues were detected in the inspected public pages. This is not a full technical SEO certification.</li>";
 
-  $("pubCountryNote").textContent = note;
-  $("dashboardCountryNote").textContent = note;
+  $("reportAuditFindings").innerHTML = list;
+  $("dashboardAuditFindings").innerHTML = list;
 }
 
 function renderPublicAnalysis(d) {
-  const o = d.overview || {};
-  const pos = o.positions || {};
+  $("pubTitle").textContent = "Public website analysis of " + d.domain;
 
-  const top10Values = [pos.top1, pos.top3, pos.top10]
-    .filter(v => v !== null && v !== undefined && Number.isFinite(Number(v)))
-    .map(Number);
-
-  const top10 = top10Values.length
-    ? top10Values.reduce((sum, v) => sum + v, 0)
-    : null;
-
-  $("pubTitle").textContent = "Organic traffic of https://" + d.domain;
-  $("pubTraffic").textContent = compactCount(o.organicTraffic);
-  $("pubValue").textContent = moneyValue(o.trafficValue);
-  $("pubDR").textContent = o.domainRating === null || o.domainRating === undefined ? "No Data" : String(o.domainRating);
-  $("pubUR").textContent = o.urlRating === null || o.urlRating === undefined ? "No Data" : String(o.urlRating);
+  $("pubTraffic").textContent = "No Data";
+  $("pubValue").textContent = "No Data";
+  $("pubDR").textContent = "No Data";
+  $("pubUR").textContent = "No Data";
 
   $("dashboardDomain").textContent =
-    "Domain: " + d.domain + " · Organic traffic: YepAPI · Country estimates: Vaneform";
+    "Domain: " + d.domain + " · Public website technical analysis";
 
-  $("dashTraffic").textContent = compactCount(o.organicTraffic);
-  $("dashKeywords").textContent = compactCount(o.organicKeywords);
-  $("dashValue").textContent = moneyValue(o.trafficValue);
-  $("dashTop10").textContent = top10 === null ? "No Data" : compactCount(top10);
+  $("dashTraffic").textContent = "No Data";
+  $("dashKeywords").textContent = "No Data";
+  $("dashValue").textContent = "No Data";
+  $("dashTop10").textContent =
+    d.technicalAudit ? compactCount(d.technicalAudit.pagesChecked) : "No Data";
 
-  renderTrafficHistory(d.history, o.organicTraffic);
-
-  renderCountries(
-    d.countries || [],
-    d.countryNotice || "Country traffic data is not available."
-  );
-
-  $("pubKeywordCountry").textContent =
-    d.keywordLocation ? "(" + d.keywordLocation + " rankings)" : "";
-
-  renderKeywords(d.keywords || []);
+  renderNoTrafficCharts();
+  renderKeywords();
+  renderCountries();
   renderPages(d.pages || []);
+  renderAudit(d.technicalAudit);
+
+  $("pubKeywordCountry").textContent = "(No ranking data)";
 
   $("pubDisclaimer").textContent =
-    d.staleNotice
-      ? d.staleNotice + " " + (d.estimateNotice || "")
-      : (d.estimateNotice ||
-        "Metrics are third-party estimates, not verified Google Analytics or private Google Search Console measurements.");
-
-  const countryMeta = d.countryTraffic || {};
-
-  const countryDetails = [
-    countryMeta.estimate ? "Vaneform scope: " + countryMeta.estimate : "",
-    countryMeta.confidence ? "Confidence: " + countryMeta.confidence : "",
-    countryMeta.asOf ? "Country data as of: " + countryMeta.asOf : "",
-    countryMeta.month ? "Month: " + countryMeta.month : ""
-  ].filter(Boolean).join(" · ");
+    d.estimateNotice ||
+    "Public website files do not disclose actual organic traffic, keyword rankings, search volume or visitor countries. Missing values are shown as No Data.";
 
   $("pubCheckedAt").textContent =
     "Domain: " + d.domain +
-    " · Organic source: YepAPI" +
-    " · Country source: Vaneform" +
-    (countryDetails ? " · " + countryDetails : "") +
-    " · Checked: " +
-    new Date(d.checkedAt || Date.now()).toLocaleString() +
-    (d.stale ? " · SAVED BACKUP REPORT" : d.cached ? " · CACHED REPORT" : "");
+    " · Source: Public website HTML, robots.txt and XML sitemap" +
+    " · Checked: " + new Date(d.checkedAt || Date.now()).toLocaleString() +
+    (d.cached ? " · CACHED REPORT" : "");
 
   $("publicReport").classList.remove("hidden");
 }
@@ -1509,6 +1314,8 @@ async function runPublicAnalysis() {
   button.textContent = "Analyzing...";
   $("publicReport").classList.add("hidden");
 
+  publicMessage("Checking the public homepage, robots.txt and sitemap. Please wait.");
+
   try {
     const response = await fetch(
       "/api/public/analyze?domain=" + encodeURIComponent(domain),
@@ -1529,23 +1336,15 @@ async function runPublicAnalysis() {
 
     renderPublicAnalysis(data);
 
-    if (data.stale) {
-      publicMessage(
-        "Showing the last saved report. Live refresh is temporarily unavailable."
-      );
-    } else if (data.cached) {
-      publicMessage(
-        "Showing saved report data. No new provider request was needed."
-      );
-    } else {
-      publicMessage(
-        "Analysis complete. Organic traffic loaded from YepAPI and country estimates loaded from Vaneform when available."
-      );
-    }
-
-  } catch (e) {
     publicMessage(
-      e.message || "Could not analyze this domain. Please try again.",
+      data.cached
+        ? "Showing the saved public website analysis. No new crawl was needed."
+        : "Analysis complete. Public pages, robots.txt and sitemap checked. Traffic and keyword metrics remain No Data because public files do not disclose them."
+    );
+
+  } catch (error) {
+    publicMessage(
+      error.message || "Could not analyze this domain. Please try again.",
       true
     );
   } finally {
@@ -1570,39 +1369,21 @@ async function checkApi() {
       throw new Error(data.error || "API health check failed.");
     }
 
-    if (!data.yepapiConfigured) {
-      $("systemStatus").textContent = "● SAVED REPORTS AVAILABLE";
-      publicMessage(
-        "Worker is online. Saved reports can still be viewed, but new domain analysis needs the YepAPI key.",
-        true
-      );
-    } else if (!data.durableObjectConfigured) {
+    if (!data.durableObjectConfigured) {
       $("systemStatus").textContent = "● LOCK NOT CONFIGURED";
       publicMessage(
-        "YepAPI is configured, but the DOMAIN_LOCKS Durable Object binding is missing.",
-        true
-      );
-    } else if (!data.d1Configured) {
-      $("systemStatus").textContent = "● BUDGET DB NOT CONFIGURED";
-      publicMessage(
-        "The D1 DB binding is missing. New analysis is paused to protect API credits.",
-        true
-      );
-    } else if (!data.vaneformConfigured) {
-      $("systemStatus").textContent = "● VANEFORM NOT CONFIGURED";
-      publicMessage(
-        "YepAPI is configured, but the VANEFORM_API_KEY secret is missing. Country traffic data will not be available.",
+        "Worker is online, but DOMAIN_LOCKS Durable Object binding is missing.",
         true
       );
     } else {
       $("systemStatus").textContent = "● WORKER ONLINE";
       publicMessage(
-        "Worker, YepAPI, Vaneform, Durable Object and daily budget database are configured. Daily protection: maximum 3 new analyses with a $0.50 reservation limit. This check does not show remaining provider credits."
+        "Worker is online. Free public website analysis is enabled. No paid API keys, Google login, private Search Console or artificial daily analysis limit are required."
       );
     }
-  } catch (e) {
+  } catch (error) {
     $("systemStatus").textContent = "● API ERROR";
-    publicMessage(e.message || "API connection failed.", true);
+    publicMessage(error.message || "API connection failed.", true);
   } finally {
     button.disabled = false;
     button.textContent = original;
